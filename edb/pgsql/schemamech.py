@@ -53,7 +53,7 @@ from . import common
 from . import types
 from . import compiler
 from . import codegen
-from .common import qname as qn
+from .compiler import astutils
 
 
 def _get_exclusive_refs(tree: irast.Statement) -> Sequence[irast.Base] | None:
@@ -109,72 +109,99 @@ class ExprDataSources:
 def _to_source(sql_expr: pg_ast.Base) -> str:
     src = codegen.generate_source(sql_expr)
     # ColumnRefs are the most common thing, and they should be safe to
-    # skip parenthesizing, for deuglification purposes. anything else
-    # we put parens around, to be sure.
+    # skip parenthesizing, for de-uglification purposes.
+    # Anything else we put parens around, to be sure.
     if not isinstance(sql_expr, pg_ast.ColumnRef):
         src = f'({src})'
     return src
 
 
-def _edgeql_tree_to_expr_data(
-    sql_expr: pg_ast.Base, refs: Optional[Set[pg_ast.ColumnRef]] = None
-) -> ExprDataSources:
-    if refs is None:
-        refs = set(ast.find_children(
-            sql_expr, pg_ast.ColumnRef, lambda n: len(n.name) == 1))
+def _compile_to_expr_data(
+    ir_expr: irast.Base,
+    subject: s_types.Type | s_pointers.Pointer,
+    schema: s_schema.Schema,
+    post_process: Callable[[pg_ast.Base], pg_ast.Base] = lambda x: x
+) -> Tuple[ExprDataSources, pg_ast.Base]:
 
-    plain_expr = _to_source(sql_expr)
-
-    if isinstance(sql_expr, (pg_ast.RowExpr, pg_ast.ImplicitRowExpr)):
-        chunks = []
-
-        for elem in sql_expr.args:
-            chunks.append(_to_source(elem))
+    # find the source from the subject
+    source = subject
+    if isinstance(source, s_pointers.Pointer):
+        source = cast(
+            s_types.Type | s_pointers.Pointer, source.get_source(schema)
+        )
+    if isinstance(source, s_types.Type):
+        source_id = irast.PathId.from_type(schema, source)
     else:
-        chunks = [plain_expr]
+        assert isinstance(source, s_pointers.Pointer), source
+        source_id = irast.PathId.from_pointer(schema, source)
 
-    if isinstance(sql_expr, pg_ast.ColumnRef):
-        refs.add(sql_expr)
+    # a helper function
+    def _compile_ir(subject_alias: Optional[str]) -> pg_ast.Base:
+        external_rvars = {}
+        if subject_alias:
+            external_rvars[(source_id, 'source')] = pg_ast.RelRangeVar(
+                alias=pg_ast.Alias(aliasname=subject_alias),
+                relation=pg_ast.Relation(name=subject_alias),
+            )
 
-    for ref in refs:
-        assert isinstance(ref.name, List)
-        ref.name.insert(0, 'NEW')
-    new_expr = _to_source(sql_expr)
+        sql_expr = compiler.compile_ir_to_sql_tree(
+            ir_expr,
+            singleton_mode=True,
+            external_rvars=external_rvars,
+        )
+        return post_process(sql_expr.ast)
 
-    for ref in refs:
-        assert isinstance(ref.name, List)
-        ref.name[0] = 'OLD'
-    old_expr = _to_source(sql_expr)
+    # compile 3 times
+    plain_expr_sql = _compile_ir(None)
+    plain_expr = _to_source(plain_expr_sql)
 
-    return ExprDataSources(
-        plain=plain_expr, new=new_expr, old=old_expr, plain_chunks=chunks
+    new_expr = _to_source(_compile_ir('NEW'))
+
+    old_expr = _to_source(_compile_ir('OLD'))
+
+    # chunks
+    plain_chunks_sql = astutils.maybe_unpack_row(plain_expr_sql)
+    if len(plain_chunks_sql) == 1:
+        plain_chunks = [plain_expr]
+    else:
+        plain_chunks = [_to_source(e) for e in plain_chunks_sql]
+
+    expr_data_sources = ExprDataSources(
+        plain=plain_expr, new=new_expr, old=old_expr, plain_chunks=plain_chunks
     )
+    return expr_data_sources, plain_expr_sql
 
 
 def _edgeql_ref_to_pg_constr(
     subject: s_constraints.ConsistencySubject,
-    origin_subject: s_types.Type | s_pointers.Pointer | None,
+    origin_subject: s_types.Type | s_pointers.Pointer,
+    schema: s_schema.Schema,
     tree: irast.Base,
 ) -> ExprData:
-    sql_res = compiler.compile_ir_to_sql_tree(tree, singleton_mode=True)
 
-    sql_expr: pg_ast.Base
-    if isinstance(sql_res.ast, pg_ast.SelectStmt):
-        # XXX: use ast pattern matcher for this
-        from_clause = sql_res.ast.from_clause[0]
-        assert isinstance(from_clause, pg_ast.RelRangeVar)
-        assert isinstance(from_clause.relation, pg_ast.CommonTableExpr)
-        sql_expr = from_clause.relation.query.target_list[0].val
-    else:
-        sql_expr = sql_res.ast
+    def _sql_post_process(expr: pg_ast.Base) -> pg_ast.Base:
+        if isinstance(subject, s_scalars.ScalarType):
+            refs = set(
+                ast.find_children(
+                    expr, pg_ast.ColumnRef, lambda n: len(n.name) == 1
+                )
+            )
+            for ref in refs:
+                # work around the immutability check
+                object.__setattr__(ref, 'name', ['VALUE'])
 
-    if isinstance(tree, irast.Statement):
-        tree = tree.expr
+        if isinstance(expr, pg_ast.SelectStmt):
+            # XXX: use ast pattern matcher for this
+            from_clause = expr.from_clause[0]
+            assert isinstance(from_clause, pg_ast.RelRangeVar)
+            assert isinstance(from_clause.relation, pg_ast.CommonTableExpr)
+            return from_clause.relation.query.target_list[0].val
 
-    if isinstance(tree, irast.Set) and isinstance(tree.expr, irast.SelectStmt):
-        tree = tree.expr.result
+        return expr
 
-    is_multicol = isinstance(sql_expr, (pg_ast.RowExpr, pg_ast.ImplicitRowExpr))
+    exprdata, sql_expr = _compile_to_expr_data(
+        tree, origin_subject, schema, _sql_post_process
+    )
 
     # Determine if the sequence of references are all simple refs, not
     # expressions.  This influences the type of Postgres constraint used.
@@ -184,39 +211,14 @@ def _edgeql_ref_to_pg_constr(
         and all(isinstance(el, pg_ast.ColumnRef) for el in sql_expr.args)
     )
 
-    # Find all field references
-    #
-    refs = set(
-        ast.find_children(
-            sql_expr, pg_ast.ColumnRef, lambda n: len(n.name) == 1
-        )
-    )
-
-    if isinstance(subject, s_scalars.ScalarType):
-        # Domain constraint, replace <scalar_name> with VALUE
-        assert origin_subject
-
-        subj_pgname = common.edgedb_name_to_pg_name(str(subject.id))
-        orgsubj_pgname = common.edgedb_name_to_pg_name(str(origin_subject.id))
-
-        for ref in refs:
-            if ref.name != [subj_pgname] and ref.name != [orgsubj_pgname]:
-                raise ValueError(
-                    f'unexpected node reference in '
-                    f'ScalarType constraint: {qn(*ref.name)}'
-                )
-
-            # work around the immutability check
-            object.__setattr__(ref, 'name', ['VALUE'])
-
-    exprdata = _edgeql_tree_to_expr_data(sql_expr, refs=refs)
-
     # Scalar constraints shouldn't ever fail on NULL
     if isinstance(subject, s_scalars.ScalarType):
         exprdata.plain = f"VALUE IS NULL OR ({exprdata.plain})"
 
     return ExprData(
-        exprdata=exprdata, is_multicol=is_multicol, is_trivial=is_trivial
+        exprdata=exprdata,
+        is_multicol=len(exprdata.plain_chunks) > 1,
+        is_trivial=is_trivial
     )
 
 
@@ -273,10 +275,7 @@ def compile_constraint(
             schema,
             options=options,
         )
-        except_sql = compiler.compile_ir_to_sql_tree(
-            except_ir, singleton_mode=True
-        )
-        except_data = _edgeql_tree_to_expr_data(except_sql.ast)
+        except_data, _ = _compile_to_expr_data(except_ir, subject, schema)
 
     terminal_refs = ir_utils.get_longest_paths(ir.expr.expr.result)
     ref_tables = get_ref_storage_info(ir.schema, terminal_refs)
@@ -372,9 +371,9 @@ def compile_constraint(
                 schema,
                 options=origin_options,
             )
-            except_sql = compiler.compile_ir_to_sql_tree(
-                except_ir, singleton_mode=True)
-            origin_except_data = _edgeql_tree_to_expr_data(except_sql.ast)
+            origin_except_data, _ = _compile_to_expr_data(
+                except_ir, subject, schema
+            )
 
         origin_exclusive_expr_refs = _get_exclusive_refs(origin_ir)
         per_origin_parts.append(
@@ -402,7 +401,7 @@ def compile_constraint(
     if exclusive_expr_refs:
         exprdatas: List[ExprData] = []
         for ref in exclusive_expr_refs:
-            exprdata = _edgeql_ref_to_pg_constr(subject, None, ref)
+            exprdata = _edgeql_ref_to_pg_constr(subject, subject, schema, ref)
             exprdata.origin_subject_db_name = subject_db_name
             exprdata.origin_except_data = except_data
             exprdatas.append(exprdata)
@@ -411,7 +410,7 @@ def compile_constraint(
 
     else:
         assert len(constraint_origins) == 1
-        exprdata = _edgeql_ref_to_pg_constr(subject, origin_subject, ir)
+        exprdata = _edgeql_ref_to_pg_constr(subject, origin_subject, schema, ir)
         exprdata.origin_subject_db_name = origin_subject_db_name
         exprdata.origin_except_data = origin_except_data
 
@@ -429,7 +428,7 @@ def compile_constraint(
         if origin_exclusive_expr_refs:
             for ref in origin_exclusive_expr_refs:
                 exprdata = _edgeql_ref_to_pg_constr(
-                    subject, origin_subject, ref
+                    subject, origin_subject, schema, ref
                 )
                 exprdata.origin_subject_db_name = origin_subject_db_name
                 exprdata.origin_except_data = origin_except_data
