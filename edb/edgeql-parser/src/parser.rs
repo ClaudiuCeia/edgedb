@@ -12,6 +12,7 @@ pub struct Context<'s> {
     spec: &'s Spec,
     arena: bumpalo::Bump,
     terminal_arena: AppendOnlyVec<Terminal>,
+    inline_chain_lens: AppendOnlyVec<usize>,
 }
 
 impl<'s> Context<'s> {
@@ -20,6 +21,7 @@ impl<'s> Context<'s> {
             spec,
             arena: bumpalo::Bump::new(),
             terminal_arena: AppendOnlyVec::new(),
+            inline_chain_lens: AppendOnlyVec::new(),
         }
     }
 }
@@ -172,6 +174,17 @@ pub fn parse<'a>(input: &'a [Terminal], ctx: &'a Context) -> (Option<&'a CSTNode
         None
     };
     let errors = custom_errors::post_process(parser.errors);
+    
+    use std::io::Write;
+    let inline_chain_len = ctx.inline_chain_lens.iter().max().cloned().unwrap_or(0);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .append(true)
+        .create(true)
+        .open("inline_chain_len.txt")
+        .unwrap();
+    writeln!(file, "inline_chain_len = {inline_chain_len}").unwrap();
+
     (node, errors)
 }
 
@@ -188,6 +201,7 @@ impl<'s> Context<'s> {
             new.extend(*inlined_ids);
         }
         new.push(element);
+        self.inline_chain_lens.push(new.len());
         self.arena.alloc_slice_clone(new.as_slice())
     }
 }
