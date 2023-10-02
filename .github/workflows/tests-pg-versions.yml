@@ -506,5 +506,5 @@ jobs:
         if [[ "${{ matrix.single-mode }}" == *"NOCREATEDB"* ]]; then
           edb test -j1 -v --backend-dsn=$EDGEDB_TEST_BACKEND_DSN
         else
-          edb test -j2 -v --backend-dsn=$EDGEDB_TEST_BACKEND_DSN -k test_server_auth_jwt
+          edb test -j2 -v --backend-dsn=$EDGEDB_TEST_BACKEND_DSN -k test_server
         fi
