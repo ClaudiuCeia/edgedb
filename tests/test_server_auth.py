@@ -237,6 +237,8 @@ class TestServerAuth(tb.ConnectedTestCase):
                 f'CREATE SUPERUSER ROLE myrole_{"x" * s_def.MAX_NAME_LENGTH};')
 
     async def test_server_auth_jwt_1(self):
+        print('!' * 100)
+        print(self.cluster, type(self.cluster))
         if not self.has_create_role:
             self.skipTest("create role is not supported by the backend")
 

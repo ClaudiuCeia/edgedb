@@ -320,22 +320,7 @@ jobs:
         postgres-version: [ 14 ]
         single-mode:
          - ''
-         - 'NOCREATEDB NOCREATEROLE'
-         - 'CREATEDB NOCREATEROLE'
-        multi-tenant-mode: [ '' ]
-        include:
-          - postgres-version: 13
-            single-mode: ''
-            multi-tenant-mode: ''
-          - postgres-version: 14
-            single-mode: ''
-            multi-tenant-mode: 'remote-compiler'
-          - postgres-version: 14
-            single-mode: ''
-            multi-tenant-mode: 'multi-tenant'
-          - postgres-version: 15
-            single-mode: ''
-            multi-tenant-mode: ''
+        multi-tenant-mode: [ 'multi-tenant' ]
     services:
       postgres:
         image: fantix/pgvector:${{ matrix.postgres-version }}
@@ -501,6 +486,7 @@ jobs:
     - name: Test
       env:
         EDGEDB_TEST_POSTGRES_VERSION: ${{ matrix.postgres-version }}
+        EDGEDB_DEBUG_SERVER: 1
       run: |
         if [[ "${{ matrix.single-mode }}" ]]; then
           export EDGEDB_TEST_BACKEND_DSN=postgres://singles:test@localhost/singles
@@ -520,25 +506,5 @@ jobs:
         if [[ "${{ matrix.single-mode }}" == *"NOCREATEDB"* ]]; then
           edb test -j1 -v --backend-dsn=$EDGEDB_TEST_BACKEND_DSN
         else
-          edb test -j2 -v --backend-dsn=$EDGEDB_TEST_BACKEND_DSN
+          edb test -j2 -v --backend-dsn=$EDGEDB_TEST_BACKEND_DSN -k test_server_auth_jwt
         fi
-
-
-  workflow-notifications:
-    if: failure() && github.event_name != 'pull_request'
-    name: Notify in Slack on failures
-    needs:
-      - build
-      - test
-    runs-on: ubuntu-latest
-    permissions:
-      actions: 'read'
-    steps:
-      - name: Slack Workflow Notification
-        uses: Gamesight/slack-workflow-status@26a36836c887f260477432e4314ec3490a84f309
-        with:
-          repo_token: ${{secrets.GITHUB_TOKEN}}
-          slack_webhook_url: ${{secrets.ACTIONS_SLACK_WEBHOOK_URL}}
-          name: 'Workflow notifications'
-          icon_emoji: ':hammer:'
-          include_jobs: 'on-failure'
